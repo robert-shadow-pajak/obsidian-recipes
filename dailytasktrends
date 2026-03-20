@@ -1,0 +1,218 @@
+```dataviewjs
+/*
+  Daily task trend summary for Obsidian.
+
+  Requires:
+  - Dataview plugin
+
+  Optional but recommended:
+  - Daily Notes core plugin (or any workflow that stores daily notes in one folder)
+
+  What it does:
+  - scans tasks in notes from the "Daily Notes" folder
+  - counts how many tasks were added and completed
+  - calculates day-to-day backlog change based on open tasks
+  - renders compact summary pills with sparklines
+
+  Assumptions:
+  - daily note files are named like YYYY-MM-DD.md
+  - tasks are standard Obsidian markdown tasks
+*/
+
+const DAILY_FOLDER = "Daily Notes";
+const WINDOW = 7;
+
+// Normalize task text so the same task is easier to match across days.
+function normalizeText(s) {
+  return String(s ?? "")
+    .replace(/#[\p{L}\p{N}_/-]+/gu, "")
+    .replace(/\[id::[^\]]+\]/g, "")
+    .replace(/🆔\s+\S+/g, "")
+    .replace(/➕\s*\d{4}-\d{2}-\d{2}/g, "")
+    .replace(/✅\s*\d{4}-\d{2}-\d{2}/g, "")
+    .replace(/📅\s*\d{4}-\d{2}-\d{2}/g, "")
+    .replace(/⏳\s*\d{4}-\d{2}-\d{2}/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+// Extract YYYY-MM-DD from file path / filename.
+function fileDateFromPath(path) {
+  const m = String(path).match(/(\d{4}-\d{2}-\d{2})\.md$/);
+  return m ? m[1] : null;
+}
+
+// Convert numeric values into a unicode sparkline.
+function makeSpark(values) {
+  const bars = "▁▂▃▄▅▆▇█";
+  if (!values.length) return "";
+
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+
+  if (min === max) {
+    return values.map(v => (v === 0 ? "▁" : "█")).join("");
+  }
+
+  return values.map(v => {
+    const idx = Math.round(((v - min) / (max - min)) * (bars.length - 1));
+    return bars[Math.max(0, Math.min(bars.length - 1, idx))];
+  }).join("");
+}
+
+// Load daily notes, extract dates, keep only valid files, sort ascending.
+const pages = dv.pages(`"${DAILY_FOLDER}"`)
+  .map(p => ({
+    page: p,
+    day: fileDateFromPath(p.file.path)
+  }))
+  .where(x => x.day)
+  .sort(x => x.day, "asc");
+
+// taskMap tracks when a task first appeared and when it was completed.
+// openByDay tracks which tasks were still open on each day.
+const taskMap = new Map();
+const openByDay = new Map();
+
+for (const { page, day } of pages) {
+  if (!openByDay.has(day)) openByDay.set(day, new Set());
+
+  for (const t of page.file.tasks) {
+    const key = t.id ?? normalizeText(t.text);
+    if (!key) continue;
+
+    const existing = taskMap.get(key) ?? {
+      firstSeen: day,
+      doneDay: null
+    };
+
+    if (day < existing.firstSeen) existing.firstSeen = day;
+
+    let doneDay = null;
+    if (t.completion && t.completion.toISODate) {
+      doneDay = t.completion.toISODate();
+    } else if (t.completed) {
+      doneDay = day;
+    }
+
+    if (doneDay && (!existing.doneDay || doneDay > existing.doneDay)) {
+      existing.doneDay = doneDay;
+    }
+
+    taskMap.set(key, existing);
+
+    if (!t.completed) {
+      openByDay.get(day).add(key);
+    }
+  }
+}
+
+// Use the most recent notes only.
+// WINDOW day-to-day comparisons require WINDOW + 1 daily notes.
+const recentDays = pages.slice(-WINDOW - 1).map(x => x.day);
+
+if (recentDays.length < 2) {
+  dv.paragraph("Not enough daily notes to calculate trend.");
+} else {
+  const rows = recentDays.map(day => ({
+    key: day,
+    added: 0,
+    done: 0,
+    open: openByDay.get(day)?.size ?? 0
+  }));
+
+  const rowMap = new Map(rows.map(r => [r.key, r]));
+
+  // Count added and completed tasks for the displayed range.
+  for (const task of taskMap.values()) {
+    if (task.firstSeen && rowMap.has(task.firstSeen)) {
+      rowMap.get(task.firstSeen).added++;
+    }
+    if (task.doneDay && rowMap.has(task.doneDay)) {
+      rowMap.get(task.doneDay).done++;
+    }
+  }
+
+  // Calculate day-to-day backlog change:
+  // current open tasks - previous open tasks
+  const last7 = [];
+  for (let i = 1; i < rows.length; i++) {
+    const prev = rows[i - 1];
+    const curr = rows[i];
+
+    last7.push({
+      key: curr.key,
+      added: curr.added,
+      done: curr.done,
+      trendDelta: curr.open - prev.open
+    });
+  }
+
+  const addedTotal = last7.reduce((a, d) => a + d.added, 0);
+  const doneTotal = last7.reduce((a, d) => a + d.done, 0);
+  const trendTotal = last7.reduce((a, d) => a + d.trendDelta, 0);
+
+  const addedSpark = makeSpark(last7.map(d => d.added));
+  const doneSpark = makeSpark(last7.map(d => d.done));
+  const trendSpark = makeSpark(last7.map(d => d.trendDelta));
+
+  const trendClass =
+    trendTotal < 0 ? "is-good" :
+    trendTotal > 0 ? "is-bad" :
+    "is-flat";
+
+  const trendSign =
+    trendTotal > 0 ? "+" :
+    trendTotal < 0 ? "" :
+    "±";
+
+  const html = `
+  <style>
+    .mini-trend-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      font-family: var(--font-interface);
+      margin: 4px 0 8px 0;
+    }
+    .mini-pill {
+      padding: 4px 10px;
+      border: 1px solid var(--background-modifier-border);
+      border-radius: 999px;
+      font-size: 0.92em;
+      white-space: nowrap;
+    }
+    .mini-spark {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      letter-spacing: 0.08em;
+      margin-left: 6px;
+      color: var(--text-muted);
+    }
+    .trend-pill.is-good {
+      color: var(--text-success, #16a34a);
+      border-color: color-mix(in srgb, var(--text-success, #16a34a) 35%, var(--background-modifier-border));
+    }
+    .trend-pill.is-bad {
+      color: var(--text-error, #dc2626);
+      border-color: color-mix(in srgb, var(--text-error, #dc2626) 35%, var(--background-modifier-border));
+    }
+    .trend-pill.is-flat {
+      color: var(--text-muted);
+    }
+    .trend-pill.is-good .mini-spark { color: var(--text-success, #16a34a); }
+    .trend-pill.is-bad .mini-spark { color: var(--text-error, #dc2626); }
+    .trend-pill.is-flat .mini-spark { color: var(--text-muted); }
+  </style>
+
+  <div class="mini-trend-row">
+    <span class="mini-pill">added <b>${addedTotal}</b><span class="mini-spark">${addedSpark}</span></span>
+    <span class="mini-pill">done <b>${doneTotal}</b><span class="mini-spark">${doneSpark}</span></span>
+    <span class="mini-pill trend-pill ${trendClass}">trend <b>${trendSign}${trendTotal}</b><span class="mini-spark">${trendSpark}</span></span>
+  </div>
+  `;
+
+  const el = dv.el("div", "");
+  el.innerHTML = html;
+}
+```
